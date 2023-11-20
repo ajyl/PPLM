@@ -32,9 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from tqdm import trange
-from transformers import GPT2Tokenizer
-from transformers.file_utils import cached_path
-from transformers.modeling_gpt2 import GPT2LMHeadModel
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
 from pplm_classification_head import ClassificationHead
 
@@ -49,22 +47,22 @@ REGULAR = 1
 VERBOSE = 2
 VERY_VERBOSE = 3
 VERBOSITY_LEVELS = {
-    'quiet': QUIET,
-    'regular': REGULAR,
-    'verbose': VERBOSE,
-    'very_verbose': VERY_VERBOSE,
+    "quiet": QUIET,
+    "regular": REGULAR,
+    "verbose": VERBOSE,
+    "very_verbose": VERY_VERBOSE,
 }
 
 BAG_OF_WORDS_ARCHIVE_MAP = {
-    'legal': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/legal.txt",
-    'military': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/military.txt",
-    'monsters': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/monsters.txt",
-    'politics': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/politics.txt",
-    'positive_words': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/positive_words.txt",
-    'religion': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/religion.txt",
-    'science': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/science.txt",
-    'space': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/space.txt",
-    'technology': "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/technology.txt",
+    "legal": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/legal.txt",
+    "military": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/military.txt",
+    "monsters": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/monsters.txt",
+    "politics": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/politics.txt",
+    "positive_words": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/positive_words.txt",
+    "religion": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/religion.txt",
+    "science": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/science.txt",
+    "space": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/space.txt",
+    "technology": "https://s3.amazonaws.com/models.huggingface.co/bert/pplm/bow/technology.txt",
 }
 
 DISCRIMINATOR_MODELS_PARAMS = {
@@ -84,13 +82,21 @@ DISCRIMINATOR_MODELS_PARAMS = {
         "default_class": 3,
         "pretrained_model": "gpt2-medium",
     },
+    "toxicity": {
+        "path": "/home/repos/PPLM/paper_code/discrim_models/toxicity_classifierhead.pt",
+        "pretrained_model": "gpt2-medium",
+        "class_size": 2,
+        "embed_size": 1024,
+        "class_vocab": {"toxic": 1, "non_toxic": 0},
+        "default_class": 0,
+    },
 }
 
 
-def to_var(x, requires_grad=False, volatile=False, device='cuda'):
-    if torch.cuda.is_available() and device == 'cuda':
+def to_var(x, requires_grad=False, volatile=False, device="cuda"):
+    if torch.cuda.is_available() and device == "cuda":
         x = x.cuda()
-    elif device != 'cuda':
+    elif device != "cuda":
         x = x.to(device)
     return Variable(x, requires_grad=requires_grad, volatile=volatile)
 
@@ -107,68 +113,65 @@ def top_k_filter(logits, k, probs=False):
         values = torch.topk(logits, k)[0]
         batch_mins = values[:, -1].view(-1, 1).expand_as(logits)
         if probs:
-            return torch.where(logits < batch_mins,
-                               torch.ones_like(logits) * 0.0, logits)
-        return torch.where(logits < batch_mins,
-                           torch.ones_like(logits) * -BIG_CONST,
-                           logits)
+            return torch.where(
+                logits < batch_mins, torch.ones_like(logits) * 0.0, logits
+            )
+        return torch.where(
+            logits < batch_mins, torch.ones_like(logits) * -BIG_CONST, logits
+        )
 
 
 def perturb_past(
-        past,
-        model,
-        last,
-        unpert_past=None,
-        unpert_logits=None,
-        accumulated_hidden=None,
-        grad_norms=None,
-        stepsize=0.01,
-        one_hot_bows_vectors=None,
-        classifier=None,
-        class_label=None,
-        loss_type=0,
-        num_iterations=3,
-        horizon_length=1,
-        window_length=0,
-        decay=False,
-        gamma=1.5,
-        kl_scale=0.01,
-        device='cuda',
-        verbosity_level=REGULAR
+    past,
+    model,
+    last,
+    unpert_past=None,
+    unpert_logits=None,
+    accumulated_hidden=None,
+    grad_norms=None,
+    stepsize=0.01,
+    one_hot_bows_vectors=None,
+    classifier=None,
+    class_label=None,
+    loss_type=0,
+    num_iterations=3,
+    horizon_length=1,
+    window_length=0,
+    decay=False,
+    gamma=1.5,
+    kl_scale=0.01,
+    device="cuda",
+    verbosity_level=REGULAR,
 ):
     # Generate inital perturbed past
-    grad_accumulator = [
-        (np.zeros(p.shape).astype("float32"))
-        for p in past
-    ]
+    grad_accumulator = [(np.zeros(p[0].shape).astype("float32")) for p in past]
 
     if accumulated_hidden is None:
         accumulated_hidden = 0
 
     if decay:
         decay_mask = torch.arange(
-            0.,
-            1.0 + SMALL_CONST,
-            1.0 / (window_length)
+            0.0, 1.0 + SMALL_CONST, 1.0 / (window_length)
         )[1:]
     else:
         decay_mask = 1.0
 
     # TODO fix this comment (SUMANTH)
     # Generate a mask is gradient perturbated is based on a past window
-    _, _, _, curr_length, _ = past[0].shape
+    # (batch_size, num_heads, seq_length, head_dim)
+    _, _, curr_length, _ = past[0][0].shape
 
     if curr_length > window_length and window_length > 0:
         ones_key_val_shape = (
-                tuple(past[0].shape[:-2])
-                + tuple([window_length])
-                + tuple(past[0].shape[-1:])
+            tuple(past[0][0].shape[:-2])
+            + tuple([window_length])
+            + tuple(past[0][0].shape[-1:])
         )
 
         zeros_key_val_shape = (
-                tuple(past[0].shape[:-2])
-                + tuple([curr_length - window_length])
-                + tuple(past[0].shape[-1:])
+            tuple(past[0][0].shape[:-2])
+            + tuple([curr_length - window_length])
+            + tuple(past[0][0].shape[-1:])
         )
 
         ones_mask = torch.ones(ones_key_val_shape)
@@ -176,11 +179,10 @@ def perturb_past(
         ones_mask = ones_mask.permute(0, 1, 2, 4, 3)
 
         window_mask = torch.cat(
-            (ones_mask, torch.zeros(zeros_key_val_shape)),
-            dim=-2
+            (ones_mask, torch.zeros(zeros_key_val_shape)), dim=-2
         ).to(device)
     else:
-        window_mask = torch.ones_like(past[0]).to(device)
+        window_mask = torch.ones_like(past[0][0]).to(device)
 
     # accumulate perturbations for num_iterations
     loss_per_iter = []
@@ -194,14 +196,17 @@ def perturb_past(
         ]
 
         # Compute hidden using perturbed past
-        perturbed_past = list(map(add, past, curr_perturbation))
-        _, _, _, curr_length, _ = curr_perturbation[0].shape
-        all_logits, _, all_hidden = model(last, past=perturbed_past)
+        perturbed_past_key = list(map(add, [p[0] for p in past], curr_perturbation))
+        perturbed_past_value = list(map(add, [p[1] for p in past], curr_perturbation))
+        perturbed_past = list(zip(perturbed_past_key, perturbed_past_value))
+        _, _, curr_length, _ = curr_perturbation[0].shape
+        _output = model(last, past_key_values=perturbed_past)
+        all_logits = _output["logits"]
+        all_hidden = _output["hidden_states"]
         hidden = all_hidden[-1]
-        new_accumulated_hidden = accumulated_hidden + torch.sum(
-            hidden,
-            dim=1
-        ).detach()
+        new_accumulated_hidden = (
+            accumulated_hidden + torch.sum(hidden, dim=1).detach()
+        )
         # TODO: Check the layer-norm consistency of this with trained discriminator (Sumanth)
         logits = all_logits[:, -1, :]
         probs = F.softmax(logits, dim=-1)
@@ -225,20 +230,25 @@ def perturb_past(
             wte = model.resize_token_embeddings()
             for _ in range(horizon_length):
                 inputs_embeds = torch.matmul(curr_probs, wte.weight.data)
-                _, curr_unpert_past, curr_all_hidden = model(
-                    past=curr_unpert_past,
-                    inputs_embeds=inputs_embeds
+                _output = model(
+                    past_key_values=curr_unpert_past, inputs_embeds=inputs_embeds
                 )
+                curr_unpert_past = _output["past_key_values"]
+                curr_all_hidden = _output["hidden_states"]
                 curr_hidden = curr_all_hidden[-1]
                 new_accumulated_hidden = new_accumulated_hidden + torch.sum(
-                    curr_hidden, dim=1)
+                    curr_hidden, dim=1
+                )
 
-            prediction = classifier(new_accumulated_hidden /
-                                    (curr_length + 1 + horizon_length))
+            prediction = classifier(
+                new_accumulated_hidden / (curr_length + 1 + horizon_length)
+            )
 
-            label = torch.tensor(prediction.shape[0] * [class_label],
-                                 device=device,
-                                 dtype=torch.long)
+            label = torch.tensor(
+                prediction.shape[0] * [class_label],
+                device=device,
+                dtype=torch.long,
+            )
             discrim_loss = ce_loss(prediction, label)
             if verbosity_level >= VERY_VERBOSE:
                 print(" pplm_discrim_loss:", discrim_loss.data.cpu().numpy())
@@ -249,22 +259,27 @@ def perturb_past(
         if kl_scale > 0.0:
             unpert_probs = F.softmax(unpert_logits[:, -1, :], dim=-1)
             unpert_probs = (
-                    unpert_probs + SMALL_CONST *
-                    (unpert_probs <= SMALL_CONST).float().to(device).detach()
+                unpert_probs
+                + SMALL_CONST
+                * (unpert_probs <= SMALL_CONST).float().to(device).detach()
             )
-            correction = SMALL_CONST * (probs <= SMALL_CONST).float().to(
-                device).detach()
+            correction = (
+                SMALL_CONST
+                * (probs <= SMALL_CONST).float().to(device).detach()
+            )
             corrected_probs = probs + correction.detach()
             kl_loss = kl_scale * (
-                (corrected_probs * (corrected_probs / unpert_probs).log()).sum()
+                (
+                    corrected_probs * (corrected_probs / unpert_probs).log()
+                ).sum()
             )
             if verbosity_level >= VERY_VERBOSE:
-                print(' kl_loss', kl_loss.data.cpu().numpy())
+                print(" kl_loss", kl_loss.data.cpu().numpy())
             loss += kl_loss
 
         loss_per_iter.append(loss.data.cpu().numpy())
         if verbosity_level >= VERBOSE:
-            print(' pplm_loss', (loss - kl_loss).data.cpu().numpy())
+            print(" pplm_loss", (loss - kl_loss).data.cpu().numpy())
 
         # compute gradients
         loss.backward()
@@ -283,9 +298,10 @@ def perturb_past(
 
         # normalize gradients
         grad = [
-            -stepsize *
-            (p_.grad * window_mask / grad_norms[
-                index] ** gamma).data.cpu().numpy()
+            -stepsize
+            * (p_.grad * window_mask / grad_norms[index] ** gamma)
+            .data.cpu()
+            .numpy()
             for index, p_ in enumerate(curr_perturbation)
         ]
 
@@ -299,7 +315,7 @@ def perturb_past(
         # removing past from the graph
         new_past = []
         for p_ in past:
-            new_past.append(p_.detach())
+            new_past.append((p_[0].detach(), p_[1].detach()))
         past = new_past
 
     # apply the accumulated perturbations to the past
@@ -307,34 +323,38 @@ def perturb_past(
         to_var(torch.from_numpy(p_), requires_grad=True, device=device)
         for p_ in grad_accumulator
     ]
-    pert_past = list(map(add, past, grad_accumulator))
+    pert_past_key = list(map(add, [p[0] for p in past], grad_accumulator))
+    pert_past_value = list(map(add, [p[1] for p in past], grad_accumulator))
+    pert_past = list(zip(pert_past_key, pert_past_value))
 
     return pert_past, new_accumulated_hidden, grad_norms, loss_per_iter
 
 
 def get_classifier(
-        name: Optional[str],
-        class_label: Union[str, int],
-        device: str,
-        verbosity_level: int = REGULAR
+    name: Optional[str],
+    class_label: Union[str, int],
+    device: str,
+    verbosity_level: int = REGULAR,
 ) -> Tuple[Optional[ClassificationHead], Optional[int]]:
     if name is None:
         return None, None
 
     params = DISCRIMINATOR_MODELS_PARAMS[name]
     classifier = ClassificationHead(
-        class_size=params['class_size'],
-        embed_size=params['embed_size']
+        class_size=params["class_size"], embed_size=params["embed_size"]
     ).to(device)
     if "url" in params:
-        resolved_archive_file = cached_path(params["url"])
+        breakpoint()
     elif "path" in params:
         resolved_archive_file = params["path"]
     else:
-        raise ValueError("Either url or path have to be specified "
-                         "in the discriminator model parameters")
+        raise ValueError(
+            "Either url or path have to be specified "
+            "in the discriminator model parameters"
+        )
     classifier.load_state_dict(
-        torch.load(resolved_archive_file, map_location=device))
+        torch.load(resolved_archive_file, map_location=device)
+    )
     classifier.eval()
 
     if isinstance(class_label, str):
@@ -363,8 +383,9 @@ def get_classifier(
     return classifier, label_id
 
 
-def get_bag_of_words_indices(bag_of_words_ids_or_paths: List[str], tokenizer) -> \
-        List[List[List[int]]]:
+def get_bag_of_words_indices(
+    bag_of_words_ids_or_paths: List[str], tokenizer
+) -> List[List[List[int]]]:
     bow_indices = []
     for id_or_path in bag_of_words_ids_or_paths:
         if id_or_path in BAG_OF_WORDS_ARCHIVE_MAP:
@@ -374,14 +395,19 @@ def get_bag_of_words_indices(bag_of_words_ids_or_paths: List[str], tokenizer) ->
         with open(filepath, "r") as f:
             words = f.read().strip().split("\n")
         bow_indices.append(
-            [tokenizer.encode(word.strip(),
-                              add_prefix_space=True,
-                              add_special_tokens=False)
-             for word in words])
+            [
+                tokenizer.encode(
+                    word.strip(),
+                    add_prefix_space=True,
+                    add_special_tokens=False,
+                )
+                for word in words
+            ]
+        )
     return bow_indices
 
 
-def build_bows_one_hot_vectors(bow_indices, tokenizer, device='cuda'):
+def build_bows_one_hot_vectors(bow_indices, tokenizer, device="cuda"):
     if bow_indices is None:
         return None
 
@@ -397,46 +423,45 @@ def build_bows_one_hot_vectors(bow_indices, tokenizer, device='cuda'):
 
 
 def full_text_generation(
-        model,
-        tokenizer,
-        context=None,
-        num_samples=1,
-        device="cuda",
-        bag_of_words=None,
-        discrim=None,
-        class_label=None,
-        length=100,
-        stepsize=0.02,
-        temperature=1.0,
-        top_k=10,
-        sample=True,
-        num_iterations=3,
-        grad_length=10000,
-        horizon_length=1,
-        window_length=0,
-        decay=False,
-        gamma=1.5,
-        gm_scale=0.9,
-        kl_scale=0.01,
-        verbosity_level=REGULAR,
-        **kwargs
+    model,
+    tokenizer,
+    context=None,
+    num_samples=1,
+    device="cuda",
+    bag_of_words=None,
+    discrim=None,
+    class_label=None,
+    length=100,
+    stepsize=0.02,
+    temperature=1.0,
+    top_k=10,
+    sample=True,
+    num_iterations=3,
+    grad_length=10000,
+    horizon_length=1,
+    window_length=0,
+    decay=False,
+    gamma=1.5,
+    gm_scale=0.9,
+    kl_scale=0.01,
+    verbosity_level=REGULAR,
+    **kwargs
 ):
-    classifier, class_id = get_classifier(
-        discrim,
-        class_label,
-        device
-    )
+    classifier, class_id = get_classifier(discrim, class_label, device)
 
     bow_indices = []
     if bag_of_words:
-        bow_indices = get_bag_of_words_indices(bag_of_words.split(";"),
-                                               tokenizer)
+        bow_indices = get_bag_of_words_indices(
+            bag_of_words.split(";"), tokenizer
+        )
 
     if bag_of_words and classifier:
         loss_type = PPLM_BOW_DISCRIM
         if verbosity_level >= REGULAR:
-            print("Both PPLM-BoW and PPLM-Discrim are on. "
-                  "This is not optimized.")
+            print(
+                "Both PPLM-BoW and PPLM-Discrim are on. "
+                "This is not optimized."
+            )
 
     elif bag_of_words:
         loss_type = PPLM_BOW
@@ -459,9 +484,9 @@ def full_text_generation(
         length=length,
         sample=sample,
         perturb=False,
-        verbosity_level=verbosity_level
+        verbosity_level=verbosity_level,
     )
-    if device == 'cuda':
+    if device == "cuda":
         torch.cuda.empty_cache()
 
     pert_gen_tok_texts = []
@@ -492,44 +517,49 @@ def full_text_generation(
             gamma=gamma,
             gm_scale=gm_scale,
             kl_scale=kl_scale,
-            verbosity_level=verbosity_level
+            verbosity_level=verbosity_level,
         )
         pert_gen_tok_texts.append(pert_gen_tok_text)
         if classifier is not None:
             discrim_losses.append(discrim_loss.data.cpu().numpy())
         losses_in_time.append(loss_in_time)
 
-    if device == 'cuda':
+    if device == "cuda":
         torch.cuda.empty_cache()
 
-    return unpert_gen_tok_text, pert_gen_tok_texts, discrim_losses, losses_in_time
+    return (
+        unpert_gen_tok_text,
+        pert_gen_tok_texts,
+        discrim_losses,
+        losses_in_time,
+    )
 
 
 def generate_text_pplm(
-        model,
-        tokenizer,
-        context=None,
-        past=None,
-        device="cuda",
-        perturb=True,
-        bow_indices=None,
-        classifier=None,
-        class_label=None,
-        loss_type=0,
-        length=100,
-        stepsize=0.02,
-        temperature=1.0,
-        top_k=10,
-        sample=True,
-        num_iterations=3,
-        grad_length=10000,
-        horizon_length=1,
-        window_length=0,
-        decay=False,
-        gamma=1.5,
-        gm_scale=0.9,
-        kl_scale=0.01,
-        verbosity_level=REGULAR
+    model,
+    tokenizer,
+    context=None,
+    past=None,
+    device="cuda",
+    perturb=True,
+    bow_indices=None,
+    classifier=None,
+    class_label=None,
+    loss_type=0,
+    length=100,
+    stepsize=0.02,
+    temperature=1.0,
+    top_k=10,
+    sample=True,
+    num_iterations=3,
+    grad_length=10000,
+    horizon_length=1,
+    window_length=0,
+    decay=False,
+    gamma=1.5,
+    gm_scale=0.9,
+    kl_scale=0.01,
+    verbosity_level=REGULAR,
 ):
     output_so_far = None
     if context:
@@ -539,8 +569,9 @@ def generate_text_pplm(
         output_so_far = context_t
 
     # collect one hot vectors for bags of words
-    one_hot_bows_vectors = build_bows_one_hot_vectors(bow_indices, tokenizer,
-                                                      device)
+    one_hot_bows_vectors = build_bows_one_hot_vectors(
+        bow_indices, tokenizer, device
+    )
 
     grad_norms = None
     last = None
@@ -554,6 +585,9 @@ def generate_text_pplm(
 
     for i in range_func:
 
+        #if past is not None and isinstance(past[0], tuple):
+        #    breakpoint()
+
         # Get past/probs for current output, except for last word
         # Note that GPT takes 2 inputs: past + current_token
 
@@ -561,9 +595,13 @@ def generate_text_pplm(
         if past is None and output_so_far is not None:
             last = output_so_far[:, -1:]
             if output_so_far.shape[1] > 1:
-                _, past, _ = model(output_so_far[:, :-1])
+                _output = model(output_so_far[:, :-1])
+                past = _output["past_key_values"]
 
-        unpert_logits, unpert_past, unpert_all_hidden = model(output_so_far)
+        _output = model(output_so_far)
+        unpert_logits = _output["logits"]
+        unpert_past = _output["past_key_values"]
+        unpert_all_hidden = _output["hidden_states"]
         unpert_last_hidden = unpert_all_hidden[-1]
 
         # check if we are abowe grad max length
@@ -601,26 +639,29 @@ def generate_text_pplm(
                     gamma=gamma,
                     kl_scale=kl_scale,
                     device=device,
-                    verbosity_level=verbosity_level
+                    verbosity_level=verbosity_level,
                 )
                 loss_in_time.append(loss_this_iter)
             else:
                 pert_past = past
 
-        pert_logits, past, pert_all_hidden = model(last, past=pert_past)
+        _output = model(last, past_key_values=pert_past)
+        pert_logits = _output["logits"]
+        past = _output["past_key_values"]
         pert_logits = pert_logits[:, -1, :] / temperature  # + SMALL_CONST
         pert_probs = F.softmax(pert_logits, dim=-1)
 
         if classifier is not None:
             ce_loss = torch.nn.CrossEntropyLoss()
             prediction = classifier(torch.mean(unpert_last_hidden, dim=1))
-            label = torch.tensor([class_label], device=device,
-                                 dtype=torch.long)
+            label = torch.tensor(
+                [class_label], device=device, dtype=torch.long
+            )
             unpert_discrim_loss = ce_loss(prediction, label)
             if verbosity_level >= VERBOSE:
                 print(
                     "unperturbed discrim loss",
-                    unpert_discrim_loss.data.cpu().numpy()
+                    unpert_discrim_loss.data.cpu().numpy(),
                 )
         else:
             unpert_discrim_loss = 0
@@ -630,10 +671,12 @@ def generate_text_pplm(
 
             unpert_probs = F.softmax(unpert_logits[:, -1, :], dim=-1)
 
-            pert_probs = ((pert_probs ** gm_scale) * (
-                    unpert_probs ** (1 - gm_scale)))  # + SMALL_CONST
-            pert_probs = top_k_filter(pert_probs, k=top_k,
-                                      probs=True)  # + SMALL_CONST
+            pert_probs = (pert_probs ** gm_scale) * (
+                unpert_probs ** (1 - gm_scale)
+            )  # + SMALL_CONST
+            pert_probs = top_k_filter(
+                pert_probs, k=top_k, probs=True
+            )  # + SMALL_CONST
 
             # rescale
             if torch.sum(pert_probs) <= 1:
@@ -652,7 +695,8 @@ def generate_text_pplm(
 
         # update context/output_so_far appending the new token
         output_so_far = (
-            last if output_so_far is None
+            last
+            if output_so_far is None
             else torch.cat((output_so_far, last), dim=1)
         )
         if verbosity_level >= REGULAR:
@@ -663,45 +707,49 @@ def generate_text_pplm(
 
 def set_generic_model_params(discrim_weights, discrim_meta):
     if discrim_weights is None:
-        raise ValueError('When using a generic discriminator, '
-                         'discrim_weights need to be specified')
+        raise ValueError(
+            "When using a generic discriminator, "
+            "discrim_weights need to be specified"
+        )
     if discrim_meta is None:
-        raise ValueError('When using a generic discriminator, '
-                         'discrim_meta need to be specified')
+        raise ValueError(
+            "When using a generic discriminator, "
+            "discrim_meta need to be specified"
+        )
 
-    with open(discrim_meta, 'r') as discrim_meta_file:
+    with open(discrim_meta, "r") as discrim_meta_file:
         meta = json.load(discrim_meta_file)
-    meta['path'] = discrim_weights
-    DISCRIMINATOR_MODELS_PARAMS['generic'] = meta
+    meta["path"] = discrim_weights
+    DISCRIMINATOR_MODELS_PARAMS["generic"] = meta
 
 
 def run_pplm_example(
-        pretrained_model="gpt2-medium",
-        cond_text="",
-        uncond=False,
-        num_samples=1,
-        bag_of_words=None,
-        discrim=None,
-        discrim_weights=None,
-        discrim_meta=None,
-        class_label=-1,
-        length=100,
-        stepsize=0.02,
-        temperature=1.0,
-        top_k=10,
-        sample=True,
-        num_iterations=3,
-        grad_length=10000,
-        horizon_length=1,
-        window_length=0,
-        decay=False,
-        gamma=1.5,
-        gm_scale=0.9,
-        kl_scale=0.01,
-        seed=0,
-        no_cuda=False,
-        colorama=False,
-        verbosity='regular'
+    pretrained_model="gpt2-medium",
+    cond_text="",
+    uncond=False,
+    num_samples=1,
+    bag_of_words=None,
+    discrim=None,
+    discrim_weights=None,
+    discrim_meta=None,
+    class_label=-1,
+    length=100,
+    stepsize=0.02,
+    temperature=1.0,
+    top_k=10,
+    sample=True,
+    num_iterations=3,
+    grad_length=10000,
+    horizon_length=1,
+    window_length=0,
+    decay=False,
+    gamma=1.5,
+    gm_scale=0.9,
+    kl_scale=0.01,
+    seed=0,
+    no_cuda=False,
+    colorama=False,
+    verbosity="regular",
 ):
     # set Random seed
     torch.manual_seed(seed)
@@ -713,7 +761,7 @@ def run_pplm_example(
     # set the device
     device = "cuda" if torch.cuda.is_available() and not no_cuda else "cpu"
 
-    if discrim == 'generic':
+    if discrim == "generic":
         set_generic_model_params(discrim_weights, discrim_meta)
 
     if discrim is not None:
@@ -723,13 +771,14 @@ def run_pplm_example(
         if pretrained_model != discriminator_pretrained_model:
             pretrained_model = discriminator_pretrained_model
             if verbosity_level >= REGULAR:
-                print("discrim = {}, pretrained_model set "
-                "to discriminator's = {}".format(discrim, pretrained_model))
+                print(
+                    "discrim = {}, pretrained_model set "
+                    "to discriminator's = {}".format(discrim, pretrained_model)
+                )
 
     # load pretrained model
     model = GPT2LMHeadModel.from_pretrained(
-        pretrained_model,
-        output_hidden_states=True
+        pretrained_model, output_hidden_states=True
     )
     model.to(device)
     model.eval()
@@ -744,8 +793,7 @@ def run_pplm_example(
     # figure out conditioning text
     if uncond:
         tokenized_cond_text = tokenizer.encode(
-            [tokenizer.bos_token],
-            add_special_tokens=False
+            [tokenizer.bos_token], add_special_tokens=False
         )
     else:
         raw_text = cond_text
@@ -753,8 +801,7 @@ def run_pplm_example(
             print("Did you forget to add `--cond_text`? ")
             raw_text = input("Model prompt >>> ")
         tokenized_cond_text = tokenizer.encode(
-            tokenizer.bos_token + raw_text,
-            add_special_tokens=False
+            tokenizer.bos_token + raw_text, add_special_tokens=False
         )
 
     print("= Prefix of sentence =")
@@ -787,7 +834,7 @@ def run_pplm_example(
         gamma=gamma,
         gm_scale=gm_scale,
         kl_scale=kl_scale,
-        verbosity_level=verbosity_level
+        verbosity_level=verbosity_level,
     )
 
     # untokenize unperturbed text
@@ -803,8 +850,9 @@ def run_pplm_example(
 
     bow_word_ids = set()
     if bag_of_words and colorama:
-        bow_indices = get_bag_of_words_indices(bag_of_words.split(";"),
-                                               tokenizer)
+        bow_indices = get_bag_of_words_indices(
+            bag_of_words.split(";"), tokenizer
+        )
         for single_bow_list in bow_indices:
             # filtering all words in the list composed of more than 1 token
             filtered = list(filter(lambda x: len(x) <= 1, single_bow_list))
@@ -818,13 +866,13 @@ def run_pplm_example(
             if colorama:
                 import colorama
 
-                pert_gen_text = ''
+                pert_gen_text = ""
                 for word_id in pert_gen_tok_text.tolist()[0]:
                     if word_id in bow_word_ids:
-                        pert_gen_text += '{}{}{}'.format(
+                        pert_gen_text += "{}{}{}".format(
                             colorama.Fore.RED,
                             tokenizer.decode([word_id]),
-                            colorama.Style.RESET_ALL
+                            colorama.Style.RESET_ALL,
                         )
                     else:
                         pert_gen_text += tokenizer.decode([word_id])
@@ -845,7 +893,7 @@ def run_pplm_example(
     return
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--pretrained_model",
@@ -855,12 +903,15 @@ if __name__ == '__main__':
         help="pretrained model name or path to local checkpoint",
     )
     parser.add_argument(
-        "--cond_text", type=str, default="The lake",
-        help="Prefix texts to condition on"
+        "--cond_text",
+        type=str,
+        default="The lake",
+        help="Prefix texts to condition on",
     )
     parser.add_argument(
-        "--uncond", action="store_true",
-        help="Generate from end-of-text as prefix"
+        "--uncond",
+        action="store_true",
+        help="Generate from end-of-text as prefix",
     )
     parser.add_argument(
         "--num_samples",
@@ -874,8 +925,8 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help="Bags of words used for PPLM-BoW. "
-             "Either a BOW id (see list in code) or a filepath. "
-             "Multiple BoWs separated by ;",
+        "Either a BOW id (see list in code) or a filepath. "
+        "Multiple BoWs separated by ;",
     )
     parser.add_argument(
         "--discrim",
@@ -885,10 +936,18 @@ if __name__ == '__main__':
         choices=("clickbait", "sentiment", "toxicity", "generic"),
         help="Discriminator to use",
     )
-    parser.add_argument('--discrim_weights', type=str, default=None,
-                        help='Weights for the generic discriminator')
-    parser.add_argument('--discrim_meta', type=str, default=None,
-                        help='Meta information for the generic discriminator')
+    parser.add_argument(
+        "--discrim_weights",
+        type=str,
+        default=None,
+        help="Weights for the generic discriminator",
+    )
+    parser.add_argument(
+        "--discrim_meta",
+        type=str,
+        default=None,
+        help="Meta information for the generic discriminator",
+    )
     parser.add_argument(
         "--class_label",
         type=int,
@@ -900,8 +959,9 @@ if __name__ == '__main__':
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument(
-        "--sample", action="store_true",
-        help="Generate from end-of-text as prefix"
+        "--sample",
+        action="store_true",
+        help="Generate from end-of-text as prefix",
     )
     parser.add_argument("--num_iterations", type=int, default=3)
     parser.add_argument("--grad_length", type=int, default=10000)
@@ -910,7 +970,7 @@ if __name__ == '__main__':
         type=int,
         default=0,
         help="Length of past which is being optimized; "
-             "0 corresponds to infinite window length",
+        "0 corresponds to infinite window length",
     )
     parser.add_argument(
         "--horizon_length",
@@ -918,19 +978,27 @@ if __name__ == '__main__':
         default=1,
         help="Length of future to optimize over",
     )
-    parser.add_argument("--decay", action="store_true",
-                        help="whether to decay or not")
+    parser.add_argument(
+        "--decay", action="store_true", help="whether to decay or not"
+    )
     parser.add_argument("--gamma", type=float, default=1.5)
     parser.add_argument("--gm_scale", type=float, default=0.9)
     parser.add_argument("--kl_scale", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_cuda", action="store_true", help="no cuda")
-    parser.add_argument("--colorama", action="store_true",
-                        help="colors keywords")
-    parser.add_argument("--verbosity", type=str, default="very_verbose",
-                        choices=(
-                            "quiet", "regular", "verbose", "very_verbose"),
-                        help="verbosiry level")
+    parser.add_argument(
+        "--colorama", action="store_true", help="colors keywords"
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=str,
+        default="very_verbose",
+        choices=("quiet", "regular", "verbose", "very_verbose"),
+        help="verbosiry level",
+    )
 
     args = parser.parse_args()
+
+    args.discrim = "toxicity"
+
     run_pplm_example(**vars(args))
