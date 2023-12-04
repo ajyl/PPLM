@@ -21,6 +21,7 @@ from torchtext import datasets
 from tqdm import tqdm, trange
 from transformers import BertTokenizer, BertModel
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import LlamaTokenizer, LlamaForCausalLM
 
 from pplm_classification_head import ClassificationHead
 
@@ -31,6 +32,8 @@ example_sentence = (
     "This is incredible! I love it, this is the best chicken I have ever had."
 )
 max_length_seq = 100
+
+LLAMA_PATH = "/scratch/mihalcea_root/mihalcea0/ajyl/llama2"
 
 
 class Discriminator(torch.nn.Module):
@@ -53,6 +56,12 @@ class Discriminator(torch.nn.Module):
             self.tokenizer = BertTokenizer.from_pretrained(pretrained_model)
             self.encoder = BertModel.from_pretrained(pretrained_model)
             self.embed_size = self.encoder.config.hidden_size
+        elif pretrained_model.startswith("llama2"):
+            self.tokenizer = LlamaTokenizer.from_pretrained(LLAMA_PATH)
+            self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            self.encoder = LlamaForCausalLM.from_pretrained(LLAMA_PATH)
+            self.embed_size = self.encoder.config.hidden_size
+
         else:
             raise ValueError(
                 "{} model not yet supported".format(pretrained_model)
@@ -88,10 +97,15 @@ class Discriminator(torch.nn.Module):
         if hasattr(self.encoder, "transformer"):
             # for gpt2
             output = self.encoder.transformer(x)
+            hidden = output["last_hidden_state"]
+        elif self.encoder.__str__().startswith("Llama"):
+            output = self.encoder(x, output_hidden_states=True)
+            hidden = output["hidden_states"][-1]
+
         else:
             # for bert
             hidden, _ = self.encoder(x)
-        masked_hidden = output["last_hidden_state"] * mask
+        masked_hidden = hidden * mask
         avg_hidden = torch.sum(masked_hidden, dim=1) / (
             torch.sum(mask, dim=1).detach() + EPSILON
         )
@@ -178,9 +192,19 @@ def train_epoch(
     epoch=0,
     log_interval=10,
     device="cpu",
+    test_loader=None,
+    valid_interval=30,
+    patience=10,
+    output_fp="testing",
 ):
+    assert test_loader is not None
     samples_so_far = 0
     discriminator.train_custom()
+    best_so_far = 9999
+    classifier_head_fp_pattern = os.path.join(
+        output_fp, "toxicity_classifier_head_epoch_{}.pt"
+    )
+    curr_patience = 0
     for batch_idx, (input_t, target_t) in enumerate(data_loader):
         input_t, target_t = input_t.to(device), target_t.to(device)
 
@@ -203,6 +227,27 @@ def train_epoch(
                     loss.item(),
                 )
             )
+
+        if batch_idx % valid_interval == 0:
+            test_loss, test_accuracy = evaluate_performance(
+                data_loader=test_loader, discriminator=discriminator, device=device
+            )
+            if test_loss < best_so_far:
+                curr_patience = 0
+                best_so_far = test_loss
+                print("New best valid loss! Saving...")
+                torch.save(
+                    discriminator.get_classifier().state_dict(),
+                    classifier_head_fp_pattern.format(epoch+1)
+                )
+
+
+            else:
+                curr_patience += 1
+                if curr_patience > patience:
+                    print("Ran out of patience, returning...")
+                    return
+
 
 
 def evaluate_performance(data_loader, discriminator, device="cpu"):
@@ -307,7 +352,7 @@ def get_generic_dataset(
                     seq = tokenizer.encode(text)
                     if len(seq) < max_length_seq:
                         if add_eos_token:
-                            seq = [50256] + seq
+                            seq = [self.token.pad_token_id] + seq
                         seq = torch.tensor(
                             seq, device=device, dtype=torch.long
                         )
@@ -393,7 +438,7 @@ def train_discriminator(
             )
             seq = discriminator.tokenizer.encode(seq)
             if add_eos_token:
-                seq = [50256] + seq
+                seq = [self.token.pad_token_id] + seq
             seq = torch.tensor(seq, device=device, dtype=torch.long)
             x.append(seq)
             y.append(class2idx[vars(train_data[i])["label"]])
@@ -407,7 +452,7 @@ def train_discriminator(
             )
             seq = discriminator.tokenizer.encode(seq)
             if add_eos_token:
-                seq = [50256] + seq
+                seq = [self.token.pad_token_id] + seq
             seq = torch.tensor(seq, device=device, dtype=torch.long)
             test_x.append(seq)
             test_y.append(class2idx[vars(test_data[i])["label"]])
@@ -450,7 +495,7 @@ def train_discriminator(
 
                     if len(seq) < max_length_seq:
                         if add_eos_token:
-                            seq = [50256] + seq
+                            seq = [self.token.pad_token_id] + seq
                         seq = torch.tensor(
                             seq, device=device, dtype=torch.long
                         )
@@ -506,7 +551,7 @@ def train_discriminator(
 
         #            if len(seq) < max_length_seq:
         #                if add_eos_token:
-        #                    seq = [50256] + seq
+        #                    seq = [self.token.pad_token_id] + seq
         #                seq = torch.tensor(
         #                    seq, device=device, dtype=torch.long
         #                )
@@ -534,7 +579,7 @@ def train_discriminator(
 
                 if len(seq) < max_length_seq:
                     if add_eos_token:
-                        seq = [50256] + seq
+                        seq = [self.token.pad_token_id] + seq
                     seq = torch.tensor(seq, device=device, dtype=torch.long)
                 else:
                     continue
@@ -543,8 +588,8 @@ def train_discriminator(
                 y.append(int(_labels))
 
         full_dataset = Dataset(x, y)
-        train_size = int(0.9 * len(full_dataset))
-        test_size = len(full_dataset) - train_size
+        test_size = 128
+        train_size = len(full_dataset) - test_size
         train_dataset, test_dataset = torch.utils.data.random_split(
             full_dataset, [train_size, test_size]
         )
@@ -584,7 +629,8 @@ def train_discriminator(
             add_eos_token=add_eos_token,
         )
         train_size = int(0.9 * len(full_dataset))
-        test_size = len(full_dataset) - train_size
+        #test_size = len(full_dataset) - train_size
+        test_size = 128
         train_dataset, test_dataset = torch.utils.data.random_split(
             full_dataset, [train_size, test_size]
         )
@@ -658,6 +704,8 @@ def train_discriminator(
             epoch=epoch,
             log_interval=log_interval,
             device=device,
+            test_loader=test_loader,
+            output_fp=output_fp,
         )
         test_loss, test_accuracy = evaluate_performance(
             data_loader=test_loader, discriminator=discriminator, device=device
@@ -758,7 +806,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained_model",
         type=str,
-        default="gpt2-medium",
+        default="llama2",
         help="Pretrained model to use as encoder",
     )
     parser.add_argument(
